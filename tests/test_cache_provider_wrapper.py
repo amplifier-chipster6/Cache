@@ -32,7 +32,9 @@ class DummyExactCache:
 def test_exact_cache_hit():
     provider = DummyProvider()
     exact_cache = DummyExactCache("cached")
-    wrapper = CacheProviderWrapper(provider, exact_cache=exact_cache, semantic_cache=None)
+    wrapper = CacheProviderWrapper(
+        provider, exact_cache=exact_cache, semantic_cache=None
+    )
 
     result = asyncio.run(wrapper.complete("request"))
 
