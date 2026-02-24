@@ -33,4 +33,11 @@ class CacheToolWrapper(Tool):
             cached = self.exact_cache.get(key)
             if cached is not None:
                 return cached
+        if self.semantic_cache and self.embedder:
+            embedding = self.embedder(key)
+            results = self.semantic_cache.query(embedding)
+            if results:
+                hit = results[0]
+                if hit:
+                    return hit
         return await self.tool.execute(input)
