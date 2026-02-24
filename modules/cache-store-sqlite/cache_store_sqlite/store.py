@@ -29,3 +29,6 @@ class SQLiteCache:
             (key, payload),
         )
         self._connection.commit()
+
+    def close(self) -> None:
+        self._connection.close()
