@@ -80,3 +80,24 @@ def test_semantic_cache_hit_tool():
     assert tool.called is False
     assert embedder.last_input == {"normalized": {"input": True}}
     assert semantic_cache.last_embedding == ["embedding"]
+
+
+def test_semantic_cache_hit_falsy_payload():
+    tool = DummyTool()
+    exact_cache = DummyExactCache(None)
+    embedder = DummyEmbedder()
+    semantic_cache = DummySemanticCache([{}])
+    wrapper = CacheToolWrapper(
+        tool,
+        exact_cache=exact_cache,
+        semantic_cache=semantic_cache,
+        normalizer=lambda value: {"normalized": value},
+        embedder=embedder,
+    )
+
+    result = asyncio.run(wrapper.execute({"input": True}))
+
+    assert result == {}
+    assert tool.called is False
+    assert embedder.last_input == {"normalized": {"input": True}}
+    assert semantic_cache.last_embedding == ["embedding"]
