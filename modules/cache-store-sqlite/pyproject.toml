@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cache-store-sqlite"
+version = "0.1.0"
+description = "SQLite cache store"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cache_store_sqlite*"]
