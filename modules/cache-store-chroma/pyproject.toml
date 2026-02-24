@@ -7,6 +7,7 @@ name = "cache-store-chroma"
 version = "0.1.0"
 description = "Chroma cache store"
 requires-python = ">=3.10"
+dependencies = ["chromadb"]
 
 [tool.setuptools.packages.find]
 where = ["."]
