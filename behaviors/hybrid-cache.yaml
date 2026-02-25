@@ -1,0 +1,27 @@
+bundle:
+  name: hybrid-cache
+  version: 0.1.0
+
+modules:
+  include:
+    - cache:modules/cache-provider-wrapper
+    - cache:modules/cache-tool-wrapper
+    - cache:modules/cache-store-sqlite
+    - cache:modules/cache-store-chroma
+    - cache:modules/cache-normalizer
+
+context:
+  include:
+    - cache:context/hybrid-cache-awareness.md
+
+config:
+  cache:
+    enabled: true
+    exact:
+      ttl: 86400
+      max_entries: 50000
+    semantic:
+      enabled: true
+      threshold: 0.90
+    storage:
+      path: ./cache
