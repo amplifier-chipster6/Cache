@@ -1,16 +1,19 @@
 try:
-    from amplifier_core.interfaces import Tool
+    from amplifier_core.interfaces import Tool  # type: ignore[import-untyped]
 except ModuleNotFoundError:
     from typing import Protocol
 
-    class Tool(Protocol):
+    class Tool(Protocol):  # type: ignore[no-redef]
         name: str
         description: str
 
         async def execute(self, input): ...
 
 
-class CacheToolWrapper(Tool):
+_DEFAULT_THRESHOLD = 0.90
+
+
+class CacheToolWrapper(Tool):  # type: ignore[misc]
     def __init__(
         self,
         tool,
@@ -29,13 +32,28 @@ class CacheToolWrapper(Tool):
 
     async def execute(self, input):
         key = self.normalizer(input) if self.normalizer else input
+
+        # 1. Exact cache lookup
         if self.exact_cache:
             cached = self.exact_cache.get(key)
             if cached is not None:
                 return cached
+
+        # 2. Semantic cache lookup with similarity threshold enforcement
         if self.semantic_cache and self.embedder:
             embedding = self.embedder(key)
-            results = self.semantic_cache.query(embedding)
-            if results is not None and len(results) > 0:
-                return results[0]
+            if embedding is not None:
+                results = self.semantic_cache.query(embedding)
+                if results:
+                    payload, distance = results[0]
+                    threshold = (
+                        self.config.get("semantic_threshold", _DEFAULT_THRESHOLD)
+                        if self.config
+                        else _DEFAULT_THRESHOLD
+                    )
+                    similarity = 1.0 - distance
+                    if similarity >= threshold:
+                        return payload
+
+        # 3. Fallback to live tool
         return await self.tool.execute(input)
