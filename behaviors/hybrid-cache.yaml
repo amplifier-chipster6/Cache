@@ -9,6 +9,7 @@ modules:
     - cache:modules/cache-store-sqlite
     - cache:modules/cache-store-chroma
     - cache:modules/cache-normalizer
+    - cache:modules/embedder-openai
 
 context:
   include:
@@ -23,5 +24,13 @@ config:
     semantic:
       enabled: true
       threshold: 0.90
+      embedding:
+        provider: openai
+        model: text-embedding-3-small
+        dimensions: 1536
+        batch_size: 32
+        timeout_s: 10
+        max_retries: 3
+        retry_backoff_s: [1, 2, 4]
     storage:
       path: ./cache
