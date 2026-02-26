@@ -18,6 +18,8 @@ context:
 config:
   cache:
     enabled: true
+    metrics:
+      enabled: true
     exact:
       ttl: 86400
       max_entries: 50000
