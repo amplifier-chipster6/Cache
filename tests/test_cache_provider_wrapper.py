@@ -23,10 +23,14 @@ class DummyExactCache:
     def __init__(self, value):
         self.value = value
         self.last_key = None
+        self.set_calls: list = []
 
     def get(self, key):
         self.last_key = key
         return self.value
+
+    def set(self, key, value):
+        self.set_calls.append((key, value))
 
 
 _SENTINEL = object()
@@ -50,10 +54,14 @@ class DummySemanticCache:
     def __init__(self, results):
         self.results = results
         self.last_embedding = None
+        self.add_calls: list = []
 
     def query(self, embedding):
         self.last_embedding = embedding
         return self.results
+
+    def add(self, id, embedding, payload):
+        self.add_calls.append((id, embedding, payload))
 
 
 # ---------------------------------------------------------------------------
@@ -551,6 +559,8 @@ class TestMetricsCounters:
             "semantic_hits",
             "semantic_misses",
             "semantic_skips",
+            "embed_errors",
+            "threshold_rejects",
             "provider_calls",
             "embed_calls",
         ):
@@ -620,3 +630,411 @@ class TestMetricsEnabledFlag:
             "hit_ratio",
         ):
             assert key in m, f"Missing key in _last_metrics: {key!r}"
+
+
+# ---------------------------------------------------------------------------
+# Helper: writable exact cache that stores write-backs and serves them back
+# ---------------------------------------------------------------------------
+
+
+class WritableExactCache:
+    """Exact cache that persists write-backs; get() returns stored values."""
+
+    def __init__(self):
+        self.stored: dict = {}
+        self.set_calls: list = []
+
+    def get(self, key):
+        return self.stored.get(key)
+
+    def set(self, key, value):
+        self.stored[key] = value
+        self.set_calls.append((key, value))
+
+
+# ---------------------------------------------------------------------------
+# Task 1: write-back on miss (provider)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteBack:
+    """After a live provider call results are written to exact and semantic caches."""
+
+    def test_exact_writeback_set_called(self):
+        """exact_cache.set() is called with (key, result) after a live call."""
+        provider = DummyProvider()
+        exact_cache = DummyExactCache(None)
+        wrapper = CacheProviderWrapper(
+            provider, exact_cache=exact_cache, semantic_cache=None
+        )
+        asyncio.run(wrapper.complete("req"))
+        assert exact_cache.set_calls == [("req", "live")]
+
+    def test_second_call_hits_exact_after_writeback(self):
+        """Result stored by write-back is returned as an exact hit on the next call."""
+        provider = DummyProvider()
+        exact_cache = WritableExactCache()
+        wrapper = CacheProviderWrapper(
+            provider, exact_cache=exact_cache, semantic_cache=None
+        )
+
+        asyncio.run(wrapper.complete("req"))  # miss -> live -> write-back
+        assert len(exact_cache.set_calls) == 1
+
+        provider.called = False
+        asyncio.run(wrapper.complete("req"))  # should hit exact cache now
+        assert provider.called is False
+        assert wrapper.exact_hits == 1
+
+    def test_no_writeback_on_exact_hit(self):
+        """No write-back occurs when the exact cache already has the value."""
+        provider = DummyProvider()
+        exact_cache = DummyExactCache("already-cached")
+        wrapper = CacheProviderWrapper(
+            provider, exact_cache=exact_cache, semantic_cache=None
+        )
+        asyncio.run(wrapper.complete("req"))
+        assert exact_cache.set_calls == []  # hit -- no live call, no write-back
+
+    def test_no_writeback_on_semantic_hit(self):
+        """No write-back occurs when the semantic cache serves the result."""
+        provider = DummyProvider()
+        exact_cache = DummyExactCache(None)
+        semantic_cache = DummySemanticCache([("sem-payload", 0.05)])
+        wrapper = CacheProviderWrapper(
+            provider,
+            exact_cache=exact_cache,
+            semantic_cache=semantic_cache,
+            embedder=DummyEmbedder(),
+        )
+        asyncio.run(wrapper.complete("req"))
+        assert exact_cache.set_calls == []  # no live call -> no write-back
+        assert semantic_cache.add_calls == []
+
+    def test_semantic_writeback_add_called(self):
+        """semantic_cache.add() is called with (key, embedding, result) after a live call."""
+        provider = DummyProvider()
+        exact_cache = DummyExactCache(None)
+        semantic_cache = DummySemanticCache([])  # empty -> miss -> live call
+        embedder = DummyEmbedder()  # returns [0.1, 0.2, 0.3]
+        wrapper = CacheProviderWrapper(
+            provider,
+            exact_cache=exact_cache,
+            semantic_cache=semantic_cache,
+            embedder=embedder,
+        )
+        asyncio.run(wrapper.complete("req"))
+        assert len(semantic_cache.add_calls) == 1
+        id_, emb, payload = semantic_cache.add_calls[0]
+        assert id_ == "req"
+        assert emb == [0.1, 0.2, 0.3]
+        assert payload == "live"
+
+    def test_no_semantic_writeback_when_embed_returns_none(self):
+        """semantic_cache.add() is skipped when the embedder returns None."""
+        provider = DummyProvider()
+        exact_cache = DummyExactCache(None)
+        semantic_cache = DummySemanticCache([])
+        wrapper = CacheProviderWrapper(
+            provider,
+            exact_cache=exact_cache,
+            semantic_cache=semantic_cache,
+            embedder=DummyEmbedder(result=None),
+        )
+        asyncio.run(wrapper.complete("req"))
+        assert semantic_cache.add_calls == []
+
+    def test_writeback_error_does_not_fail_call(self):
+        """A broken exact cache must not prevent the live result from being returned."""
+
+        class BrokenCache:
+            def get(self, key):
+                return None
+
+            def set(self, key, value):
+                raise RuntimeError("disk full")
+
+        provider = DummyProvider()
+        wrapper = CacheProviderWrapper(
+            provider, exact_cache=BrokenCache(), semantic_cache=None
+        )
+        result = asyncio.run(wrapper.complete("req"))
+        assert result == "live"  # main call still succeeds despite write-back error
+
+
+# ---------------------------------------------------------------------------
+# Task 2: nested threshold config (provider)
+# ---------------------------------------------------------------------------
+
+
+class TestNestedThresholdConfig:
+    """Threshold is read from cache.semantic.threshold with flat-key fallback."""
+
+    def _wrapper(self, distance, config):
+        provider = DummyProvider()
+        semantic_cache = DummySemanticCache([("hit", distance)])
+        return (
+            CacheProviderWrapper(
+                provider,
+                exact_cache=DummyExactCache(None),
+                semantic_cache=semantic_cache,
+                embedder=DummyEmbedder(),
+                config=config,
+            ),
+            provider,
+        )
+
+    def test_nested_threshold_accepts_within_range(self):
+        """Nested threshold 0.5 accepts similarity 0.75 (distance 0.25)."""
+        wrapper, provider = self._wrapper(
+            distance=0.25,  # similarity = 0.75
+            config={"cache": {"semantic": {"threshold": 0.5}}},
+        )
+        result = asyncio.run(wrapper.complete("req"))
+        assert result == "hit"
+        assert provider.called is False
+
+    def test_default_threshold_rejects_same_similarity(self):
+        """Default threshold 0.90 rejects similarity 0.75 (distance 0.25)."""
+        wrapper, provider = self._wrapper(distance=0.25, config={})
+        result = asyncio.run(wrapper.complete("req"))
+        assert result == "live"
+        assert provider.called is True
+
+    def test_flat_semantic_threshold_still_accepted(self):
+        """Flat semantic_threshold key still works as a fallback."""
+        wrapper, provider = self._wrapper(
+            distance=0.25,  # similarity = 0.75
+            config={"semantic_threshold": 0.5},
+        )
+        result = asyncio.run(wrapper.complete("req"))
+        assert result == "hit"
+        assert provider.called is False
+
+    def test_nested_key_takes_precedence_over_flat(self):
+        """Nested cache.semantic.threshold wins over flat semantic_threshold."""
+        # nested=0.80, flat=0.50; similarity 0.75 < nested 0.80 -> rejected
+        wrapper, provider = self._wrapper(
+            distance=0.25,  # similarity = 0.75
+            config={
+                "cache": {"semantic": {"threshold": 0.80}},
+                "semantic_threshold": 0.50,
+            },
+        )
+        result = asyncio.run(wrapper.complete("req"))
+        assert result == "live"
+        assert provider.called is True
+
+    def test_no_config_uses_default(self):
+        """No config at all -> default threshold 0.90 applies."""
+        provider = DummyProvider()
+        # distance=0.05 -> similarity=0.95, above 0.90 -> hit
+        semantic_cache = DummySemanticCache([("hit", 0.05)])
+        wrapper = CacheProviderWrapper(
+            provider,
+            exact_cache=DummyExactCache(None),
+            semantic_cache=semantic_cache,
+            embedder=DummyEmbedder(),
+            config=None,
+        )
+        result = asyncio.run(wrapper.complete("req"))
+        assert result == "hit"
+        assert provider.called is False
+
+
+# ---------------------------------------------------------------------------
+# Task 6: semantic skip sub-bucket counters (provider)
+# ---------------------------------------------------------------------------
+
+
+class TestSemanticSkipReasons:
+    """embed_errors and threshold_rejects track skip sub-reasons; semantic_skips is aggregate."""
+
+    def test_embed_none_increments_embed_errors(self):
+        """Embedder returning None -> embed_errors += 1."""
+        provider = DummyProvider()
+        wrapper = CacheProviderWrapper(
+            provider,
+            exact_cache=DummyExactCache(None),
+            semantic_cache=DummySemanticCache([("would-hit", 0.0)]),
+            embedder=DummyEmbedder(result=None),
+        )
+        asyncio.run(wrapper.complete("req"))
+        assert wrapper.embed_errors == 1
+        assert wrapper.threshold_rejects == 0
+        assert wrapper.semantic_skips == 1
+
+    def test_embed_none_embed_errors_in_counts(self):
+        """embed_errors appears in the counts snapshot."""
+        provider = DummyProvider()
+        wrapper = CacheProviderWrapper(
+            provider,
+            exact_cache=DummyExactCache(None),
+            semantic_cache=DummySemanticCache([]),
+            embedder=DummyEmbedder(result=None),
+        )
+        asyncio.run(wrapper.complete("req"))
+        counts = wrapper._last_metrics["counts"]
+        assert counts["embed_errors"] == 1
+        assert counts["threshold_rejects"] == 0
+        assert counts["semantic_skips"] == 1
+
+    def test_below_threshold_increments_threshold_rejects(self):
+        """Similarity below threshold -> threshold_rejects += 1."""
+        provider = DummyProvider()
+        wrapper = CacheProviderWrapper(
+            provider,
+            exact_cache=DummyExactCache(None),
+            semantic_cache=DummySemanticCache([("too-far", 0.20)]),  # similarity=0.80 < 0.90
+            embedder=DummyEmbedder(),
+        )
+        asyncio.run(wrapper.complete("req"))
+        assert wrapper.threshold_rejects == 1
+        assert wrapper.embed_errors == 0
+        assert wrapper.semantic_skips == 1
+
+    def test_threshold_rejects_in_counts(self):
+        """threshold_rejects appears in the counts snapshot."""
+        provider = DummyProvider()
+        wrapper = CacheProviderWrapper(
+            provider,
+            exact_cache=DummyExactCache(None),
+            semantic_cache=DummySemanticCache([("too-far", 0.20)]),
+            embedder=DummyEmbedder(),
+        )
+        asyncio.run(wrapper.complete("req"))
+        counts = wrapper._last_metrics["counts"]
+        assert counts["threshold_rejects"] == 1
+        assert counts["embed_errors"] == 0
+        assert counts["semantic_skips"] == 1
+
+    def test_semantic_hit_does_not_increment_either_sub_bucket(self):
+        """A successful semantic hit leaves both sub-counters at zero."""
+        provider = DummyProvider()
+        wrapper = CacheProviderWrapper(
+            provider,
+            exact_cache=DummyExactCache(None),
+            semantic_cache=DummySemanticCache([("hit", 0.05)]),  # similarity=0.95 >= 0.90
+            embedder=DummyEmbedder(),
+        )
+        asyncio.run(wrapper.complete("req"))
+        assert wrapper.embed_errors == 0
+        assert wrapper.threshold_rejects == 0
+        assert wrapper.semantic_skips == 0
+
+    def test_no_embedder_does_not_increment_sub_buckets(self):
+        """No-embedder skip increments semantic_skips but not either sub-bucket."""
+        provider = DummyProvider()
+        wrapper = CacheProviderWrapper(
+            provider,
+            exact_cache=DummyExactCache(None),
+            semantic_cache=DummySemanticCache([("would-hit", 0.0)]),
+            embedder=None,
+        )
+        asyncio.run(wrapper.complete("req"))
+        assert wrapper.semantic_skips == 1
+        assert wrapper.embed_errors == 0
+        assert wrapper.threshold_rejects == 0
+
+    def test_sub_bucket_counters_accumulate(self):
+        """Multiple calls accumulate sub-bucket counters independently."""
+        provider = DummyProvider()
+        wrapper = CacheProviderWrapper(
+            provider,
+            exact_cache=DummyExactCache(None),
+            semantic_cache=DummySemanticCache([("too-far", 0.20)]),  # below threshold
+            embedder=DummyEmbedder(),
+        )
+        asyncio.run(wrapper.complete("req1"))
+        asyncio.run(wrapper.complete("req2"))
+        assert wrapper.threshold_rejects == 2
+        assert wrapper.semantic_skips == 2
+        assert wrapper.embed_errors == 0
+
+
+# ---------------------------------------------------------------------------
+# Task 7: cache.semantic.enabled flag (provider)
+# ---------------------------------------------------------------------------
+
+
+class TestSemanticEnabledFlag:
+    """cache.semantic.enabled=False bypasses the semantic path entirely."""
+
+    def _wrapper_with_semantic_disabled(self, semantic_results=None):
+        provider = DummyProvider()
+        semantic_cache = DummySemanticCache(
+            semantic_results if semantic_results is not None else [("hit", 0.0)]
+        )
+        return (
+            CacheProviderWrapper(
+                provider,
+                exact_cache=DummyExactCache(None),
+                semantic_cache=semantic_cache,
+                embedder=DummyEmbedder(),
+                config={"cache": {"semantic": {"enabled": False}}},
+            ),
+            provider,
+            semantic_cache,
+        )
+
+    def test_semantic_disabled_falls_through_to_provider(self):
+        """With enabled=False, live provider is always called (no semantic lookup)."""
+        wrapper, provider, _ = self._wrapper_with_semantic_disabled()
+        result = asyncio.run(wrapper.complete("req"))
+        assert result == "live"
+        assert provider.called is True
+
+    def test_semantic_disabled_does_not_query_semantic_cache(self):
+        """semantic_cache.query() is never called when enabled=False."""
+        wrapper, _, semantic_cache = self._wrapper_with_semantic_disabled()
+        asyncio.run(wrapper.complete("req"))
+        assert semantic_cache.last_embedding is None  # query never called
+
+    def test_semantic_disabled_increments_semantic_skips(self):
+        """Skipping due to enabled=False still counts in semantic_skips."""
+        wrapper, _, _ = self._wrapper_with_semantic_disabled()
+        asyncio.run(wrapper.complete("req"))
+        assert wrapper.semantic_skips == 1
+
+    def test_semantic_disabled_does_not_increment_embed_calls(self):
+        """No embedding is attempted when semantic is disabled."""
+        wrapper, _, _ = self._wrapper_with_semantic_disabled()
+        asyncio.run(wrapper.complete("req"))
+        assert wrapper.embed_calls == 0
+
+    def test_semantic_disabled_does_not_increment_sub_buckets(self):
+        """Config-disabled skip doesn't count as embed_error or threshold_reject."""
+        wrapper, _, _ = self._wrapper_with_semantic_disabled()
+        asyncio.run(wrapper.complete("req"))
+        assert wrapper.embed_errors == 0
+        assert wrapper.threshold_rejects == 0
+
+    def test_semantic_enabled_true_uses_semantic_path(self):
+        """Explicit enabled=True behaves identically to the default."""
+        provider = DummyProvider()
+        semantic_cache = DummySemanticCache([("hit", 0.05)])  # similarity=0.95 hit
+        wrapper = CacheProviderWrapper(
+            provider,
+            exact_cache=DummyExactCache(None),
+            semantic_cache=semantic_cache,
+            embedder=DummyEmbedder(),
+            config={"cache": {"semantic": {"enabled": True}}},
+        )
+        result = asyncio.run(wrapper.complete("req"))
+        assert result == "hit"
+        assert provider.called is False
+
+    def test_semantic_enabled_default_uses_semantic_path(self):
+        """No enabled flag in config -> default True -> semantic path active."""
+        provider = DummyProvider()
+        semantic_cache = DummySemanticCache([("hit", 0.05)])
+        wrapper = CacheProviderWrapper(
+            provider,
+            exact_cache=DummyExactCache(None),
+            semantic_cache=semantic_cache,
+            embedder=DummyEmbedder(),
+            config=None,
+        )
+        result = asyncio.run(wrapper.complete("req"))
+        assert result == "hit"
+        assert provider.called is False
